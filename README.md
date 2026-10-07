@@ -4,17 +4,19 @@
 ![AWS](https://img.shields.io/badge/AWS_EC2_%7C_ECR-232F3E?style=flat-square&logo=amazonwebservices&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![Cloudflare](https://img.shields.io/badge/Cloudflare_Pages_%26_Workers-F38020?style=flat-square&logo=cloudflare&logoColor=white)
+![Amazon RDS](https://img.shields.io/badge/RDS_PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![Ruby on Rails](https://img.shields.io/badge/Ruby_on_Rails-CC0000?style=flat-square&logo=rubyonrails&logoColor=white)
 ![Vue.js](https://img.shields.io/badge/Vue.js-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)
 ![Nginx](https://img.shields.io/badge/Nginx-009639?style=flat-square&logo=nginx&logoColor=white)
 
-The DevOps setup behind **Trainings Manager**, a training management platform with a Vue.js frontend and a Ruby on Rails backend. This repository contains the deployment pipelines, branch protection rules and server configuration I designed and run. Application code is not included.
+The DevOps setup behind **Trainings Manager**, a training management platform with a Vue.js frontend, a Ruby on Rails backend and a PostgreSQL database on Amazon RDS. This repository contains the deployment pipelines, branch protection rules and server configuration I designed and run. Application code is not included.
 
 ## What this project covers
 
 - **Four environments:** `dev`, `release`, `demo` and `prod`, each with its own AWS credentials, ECR tag and EC2 host
 - **Security and quality gates:** every backend deploy runs a Brakeman security scan and RuboCop linting before an image is built
 - **Containerized backend:** Docker images are built in GitHub Actions, pushed to Amazon ECR, and pulled onto EC2
+- **Network isolation:** the app server sits in a public subnet and accepts web traffic only on HTTPS (port 443); the PostgreSQL database runs on Amazon RDS in a private subnet with no internet access
 - **Two containers per instance:** the Rails app (behind Nginx) and a Solid Queue background worker, deployed by separate pipelines
 - **Automated post-deploy tasks:** schema migrations, data migrations and seeds run inside the new container
 - **Health check and rollback signal:** the pipeline fails and prints container logs if the new container is not running
@@ -36,20 +38,38 @@ flowchart LR
     CI --> BUILD[Docker build]
     BUILD -->|push image| ECR[(Amazon ECR)]
 
-    GHA -->|SSH deploy| EC2
-
-    subgraph EC2[AWS EC2 instance per environment]
-        NGX[Nginx reverse proxy] --> APP[Rails app container :3000]
-        WRK[Solid Queue worker container]
-    end
-    ECR -->|docker pull| EC2
-
     User[Users] --> CF[Cloudflare DNS]
     CF --> FE[Vue.js on Cloudflare Pages / Workers]
-    FE -->|API calls| NGX
+
+    subgraph VPC[AWS VPC per environment]
+        subgraph PUB[Public subnet]
+            subgraph EC2[EC2 instance]
+                NGX[Nginx :443] --> APP[Rails app container :3000]
+                WRK[Solid Queue worker container]
+            end
+        end
+        subgraph PRIV[Private subnet]
+            RDS[(Amazon RDS PostgreSQL :5432)]
+        end
+    end
+
+    FE -->|HTTPS 443 only| NGX
+    GHA -->|deploy| EC2
+    ECR -->|docker pull| EC2
+    APP -->|5432, from app SG only| RDS
+    WRK -->|5432, from app SG only| RDS
     APP -->|SMTP| POSTAL[Postal mail server]
     WRK -->|SMTP| POSTAL
 ```
+
+### Network and security
+
+| Layer | Placement | Inbound access |
+|---|---|---|
+| EC2 app server (Nginx, app, worker) | Public subnet | HTTPS **443** only, via its security group |
+| Amazon RDS for PostgreSQL | Private subnet | PostgreSQL **5432** only from the app server's security group |
+
+The database has no public IP and cannot be reached from the internet. Only the app and worker containers on the EC2 instance can connect to it, which limits the attack surface to a single HTTPS entry point.
 
 ## Deployment flow (backend app)
 
@@ -95,13 +115,13 @@ All pipelines are triggered manually (`workflow_dispatch`), so releases to each 
 │   └── github-secrets.md              # Secrets each environment needs
 ├── nginx/
 │   └── trainings-manager.conf.example # Reverse proxy to the Rails container
-├── .env.example                       # Env file layout used on each EC2 host
+├── .env.example                       # Env file layout used on each EC2 host (incl. RDS DATABASE_URL)
 └── README.md
 ```
 
 ## Setup
 
-1. Create an ECR repository and an EC2 instance per environment, with Docker and Nginx installed.
+1. Per environment, create a VPC with a public and a private subnet, an ECR repository, an EC2 instance in the public subnet (Docker and Nginx installed, security group allowing 443), and an RDS PostgreSQL instance in the private subnet (security group allowing 5432 from the EC2 security group only).
 2. Place the environment file at `/opt/trainings-manager-<env>/.env` on each instance (see `.env.example`).
 3. Configure Nginx using `nginx/trainings-manager.conf.example`.
 4. Add the GitHub secrets listed in [`docs/github-secrets.md`](docs/github-secrets.md).
